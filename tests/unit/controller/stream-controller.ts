@@ -1085,6 +1085,136 @@ describe('StreamController', function () {
     });
   });
 
+  describe('audio track switching buffer management', function () {
+    const sandbox = sinon.createSandbox();
+    let media: any;
+    let videoBuffer: any;
+    let audioBuffer: any;
+    let triggerSpy: sinon.SinonSpy;
+
+    beforeEach(function () {
+      media = { currentTime: 10, buffered: new TimeRangesMock() };
+      videoBuffer = { buffered: new TimeRangesMock([0, 30]) };
+      audioBuffer = { buffered: new TimeRangesMock([0, 30]) };
+      streamController['media'] = media;
+      streamController['mediaBuffer'] = videoBuffer;
+      streamController['videoBuffer'] = videoBuffer;
+      streamController['audioBuffer'] = audioBuffer;
+      streamController['altAudio'] = 2; // AlternateAudio.SWITCHED
+      streamController['_hasEnoughToStart'] = true;
+      triggerSpy = sandbox.spy(hls, 'trigger');
+
+      // Provide a SourceBuffer so the audio remove is queued (and completed
+      // asynchronously by the test) rather than failing synchronously.
+      const bufferController = hls['bufferController']!;
+      (bufferController as any)['media'] = media;
+      (bufferController as any)['mediaSource'] = {
+        readyState: 'open',
+        duration: Number.POSITIVE_INFINITY,
+      };
+      (bufferController as any)['tracks'].audio = {
+        buffer: {
+          remove: sandbox.stub(),
+          buffered: new TimeRangesMock(),
+          updating: false,
+        },
+        listeners: [],
+        codec: '',
+        container: '',
+        id: 'main',
+      } as any;
+    });
+
+    afterEach(function () {
+      sandbox.restore();
+    });
+
+    const switchToMainAudio = () => {
+      streamController['onAudioTrackSwitching'](Events.AUDIO_TRACK_SWITCHING, {
+        id: 0,
+        name: 'main',
+        url: undefined,
+      } as any);
+    };
+
+    it('flushes only the audio buffer when switching from alt audio to main audio', function () {
+      switchToMainAudio();
+      expect(triggerSpy).to.have.been.calledWith(Events.BUFFER_FLUSHING, {
+        startOffset: 0,
+        endOffset: Number.POSITIVE_INFINITY,
+        type: 'audio',
+      });
+      expect(streamController['refillingMainAudio']).to.be.true;
+      expect(streamController['mainAudioRefillPending']).to.be.true;
+    });
+
+    it('removes main playlist fragments but leaves subtitle tracking untouched', function () {
+      const mainFrag = new Fragment(
+        PlaylistLevelType.MAIN,
+        '',
+      ) as MediaFragment;
+      mainFrag.sn = 1;
+      mainFrag.setStart(10);
+      mainFrag.duration = 5;
+      const subtitleFrag = new Fragment(
+        PlaylistLevelType.SUBTITLE,
+        '',
+      ) as MediaFragment;
+      subtitleFrag.sn = 1;
+      subtitleFrag.setStart(10);
+      subtitleFrag.duration = 5;
+      fragmentTracker.fragBuffered(mainFrag, true);
+      fragmentTracker.fragBuffered(subtitleFrag, true);
+      switchToMainAudio();
+      expect(fragmentTracker.getState(mainFrag)).to.equal(
+        FragmentState.NOT_LOADED,
+      );
+      expect(fragmentTracker.getState(subtitleFrag)).to.equal(FragmentState.OK);
+    });
+
+    it('schedules refill from the playhead while the audio flush is pending', function () {
+      switchToMainAudio();
+      expect(streamController['getMainAudioFwdBufferInfo']()).to.deep.include({
+        len: 0,
+        start: 10,
+        end: 10,
+      });
+    });
+
+    it('ignores unrelated flushes and completes on the audio flush', function () {
+      switchToMainAudio();
+      hls.trigger(Events.BUFFER_FLUSHED, {
+        type: 'video',
+        start: 0,
+        end: Number.POSITIVE_INFINITY,
+      });
+      expect(triggerSpy).to.not.have.been.calledWith(
+        Events.AUDIO_TRACK_SWITCHED,
+      );
+      expect(streamController['mainAudioRefillPending']).to.be.true;
+      hls.trigger(Events.BUFFER_FLUSHED, {
+        type: 'audio',
+        start: 0,
+        end: Number.POSITIVE_INFINITY,
+      });
+      expect(triggerSpy).to.have.been.calledWith(Events.AUDIO_TRACK_SWITCHED);
+      expect(streamController['mainAudioRefillPending']).to.be.false;
+    });
+
+    it('uses the audio buffer, not the buffered video, for scheduling once flushed', function () {
+      switchToMainAudio();
+      hls.trigger(Events.BUFFER_FLUSHED, {
+        type: 'audio',
+        start: 0,
+        end: Number.POSITIVE_INFINITY,
+      });
+      audioBuffer.buffered = new TimeRangesMock([5, 11]);
+      const bufferInfo = streamController['getMainAudioFwdBufferInfo']()!;
+      expect(bufferInfo.len).to.be.closeTo(1, 0.001);
+      expect(bufferInfo.end).to.equal(11);
+    });
+  });
+
   describe('checkFragmentChanged override', function () {
     let media: any;
     let mockFrag: Fragment;

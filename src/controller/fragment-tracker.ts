@@ -5,6 +5,7 @@ import {
   type MediaFragment,
   type Part,
 } from '../loader/fragment';
+import { PlaylistLevelType } from '../types/loader';
 import { userAgentChromeVersion } from '../utils/user-agent';
 import type Hls from '../hls';
 import type { SourceBufferName } from '../types/buffer';
@@ -19,7 +20,6 @@ import type {
   FragmentEntity,
   FragmentTimeRange,
 } from '../types/fragment-tracker';
-import type { PlaylistLevelType } from '../types/loader';
 
 export const enum FragmentState {
   NOT_LOADED = 'NOT_LOADED',
@@ -641,7 +641,29 @@ export class FragmentTracker implements ComponentAPI {
       .filter((frag): frag is MediaFragment => !!frag?.gap);
   }
 
-  public removeAllFragments() {
+  /**
+   * Remove all tracked fragments. When `playlistType` is provided, only
+   * fragments of that playlist type are removed so state for other tracks
+   * (for example subtitles) is left untouched.
+   */
+  public removeAllFragments(playlistType?: PlaylistLevelType) {
+    if (playlistType) {
+      const { fragments } = this;
+      Object.keys(fragments).forEach((key) => {
+        if (fragments[key]?.body.type === playlistType) {
+          delete fragments[key];
+        }
+      });
+      delete this.endListFragments[playlistType];
+      delete this.activePartLists[playlistType];
+      if (playlistType === PlaylistLevelType.MAIN) {
+        const partlist = this.hls?.latestLevelDetails?.partList;
+        if (partlist) {
+          partlist.forEach((part) => part.clearElementaryStreamInfo());
+        }
+      }
+      return;
+    }
     this.fragments = Object.create(null);
     this.endListFragments = Object.create(null);
     this.activePartLists = Object.create(null);

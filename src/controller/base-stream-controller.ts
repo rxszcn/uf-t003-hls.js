@@ -259,6 +259,7 @@ export default class BaseStreamController
   protected _streamEnded(
     bufferInfo: BufferInfo,
     levelDetails: LevelDetails,
+    bufferable: Bufferable | null = this.media,
   ): boolean {
     // Stream is never "ended" when playlist is live or media is detached
     if (levelDetails.live || !this.media) {
@@ -305,7 +306,7 @@ export default class BaseStreamController
       // and still be spec-compliant, so there may still be edge cases here. Likewise, there could be issues in end of stream
       // part mismatches for independent audio and video playlists/segments.
       const lastPartBuffered = BufferHelper.isBuffered(
-        this.media,
+        bufferable,
         lastPart.start + lastPart.duration / 2,
       );
       return lastPartBuffered;

@@ -648,7 +648,7 @@ export class BaseStreamController extends TaskLoop implements NetworkComponentAP
     // (undocumented)
     stopLoad(): void;
     // (undocumented)
-    protected _streamEnded(bufferInfo: BufferInfo, levelDetails: LevelDetails): boolean;
+    protected _streamEnded(bufferInfo: BufferInfo, levelDetails: LevelDetails, bufferable?: Bufferable | null): boolean;
     // (undocumented)
     protected get timelineOffset(): number;
     // (undocumented)
@@ -2148,8 +2148,7 @@ export class FragmentTracker implements ComponentAPI {
     hasParts(type: PlaylistLevelType): boolean;
     // (undocumented)
     isEndListAppended(type: PlaylistLevelType): boolean;
-    // (undocumented)
-    removeAllFragments(): void;
+    removeAllFragments(playlistType?: PlaylistLevelType): void;
     // (undocumented)
     removeFragment(fragment: Fragment): void;
     // (undocumented)

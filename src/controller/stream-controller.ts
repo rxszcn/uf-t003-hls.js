@@ -78,6 +78,25 @@ export default class StreamController
   private _backtrackFragment: Fragment | undefined = undefined;
   private audioCodecSwitch: boolean = false;
   private videoBuffer: ExtendedSourceBuffer | null = null;
+  private audioBuffer: ExtendedSourceBuffer | null = null;
+  /**
+   * Set while the main audio SourceBuffer is being refilled after switching
+   * back from an alternate audio track. Buffer scheduling observes the audio
+   * SourceBuffer instead of the media element (audio + video union) so that
+   * the buffered video is not mistaken for buffered main audio.
+   */
+  private refillingMainAudio: boolean = false;
+  /**
+   * Set until the audio SourceBuffer remove requested on switching back to
+   * main audio completes. While set, scheduling targets the current playhead
+   * so the replacement fragment can be downloaded in parallel with the flush.
+   */
+  private mainAudioRefillPending: boolean = false;
+  /**
+   * Audio track switch waiting for its audio flush to complete. Kept here so
+   * the BUFFER_FLUSHED listener can filter out unrelated (video) flushes.
+   */
+  private mainAudioSwitchData: AudioTrackSwitchingData | null = null;
 
   constructor(
     hls: Hls,
@@ -268,7 +287,9 @@ export default class StreamController
 
     // if buffer length is less than maxBufLen try to load a new fragment
 
-    const bufferInfo = this.getMainFwdBufferInfo();
+    const bufferInfo = this.refillingMainAudio
+      ? this.getMainAudioFwdBufferInfo()
+      : this.getMainFwdBufferInfo();
     if (bufferInfo === null) {
       return;
     }
@@ -276,13 +297,21 @@ export default class StreamController
     const lastDetails = this.getLevelDetails();
     if (
       lastDetails &&
-      this._streamEnded(bufferInfo, lastDetails) &&
-      this.altAudio !== AlternateAudio.SWITCHING
+      this._streamEnded(
+        bufferInfo,
+        lastDetails,
+        this.refillingMainAudio && this.audioBuffer
+          ? this.audioBuffer
+          : this.media,
+      ) &&
+      this.altAudio !== AlternateAudio.SWITCHING &&
+      !this.mainAudioRefillPending
     ) {
       const data: BufferEOSData = {
         type: this.targetBufferType(),
       };
 
+      this.refillingMainAudio = false;
       this.hls.trigger(Events.BUFFER_EOS, data);
       this.state = State.ENDED;
       return;
@@ -319,6 +348,12 @@ export default class StreamController
 
     // Stay idle if we are still with buffer margins
     if (bufferLen >= maxBufLen) {
+      if (this.refillingMainAudio) {
+        this.log(
+          'Main audio buffer refilled after switching from alternate audio',
+        );
+        this.refillingMainAudio = false;
+      }
       return;
     }
 
@@ -496,7 +531,12 @@ export default class StreamController
   }
 
   protected flushMainBuffer(startOffset: number, endOffset: number) {
-    super.flushMainBuffer(startOffset, endOffset, this.targetBufferType());
+    // While refilling main audio, never flush the video SourceBuffer.
+    super.flushMainBuffer(
+      startOffset,
+      endOffset,
+      this.refillingMainAudio ? 'audio' : this.targetBufferType(),
+    );
   }
 
   private targetBufferType(): 'video' | null {
@@ -525,6 +565,8 @@ export default class StreamController
       removeEventListener(media, 'seeked', this.onMediaSeeked);
     }
     this.videoBuffer = null;
+    this.audioBuffer = null;
+    this.cancelMainAudioRefill();
     super.onMediaDetaching(event, data);
     const transferringMedia = !!data.transferMedia;
     if (transferringMedia) {
@@ -579,6 +621,9 @@ export default class StreamController
     this.backtrackFragment = undefined;
     this.altAudio = AlternateAudio.DISABLED;
     this.audioOnly = false;
+    this.audioBuffer = null;
+    this.videoBuffer = null;
+    this.cancelMainAudioRefill();
   }
 
   private onManifestParsed(
@@ -854,6 +899,8 @@ export default class StreamController
     data: AudioTrackSwitchingData,
   ) {
     const hls = this.hls;
+    // A new switch supersedes any pending main-audio refill.
+    this.cancelMainAudioRefill();
     // if any URL found on new audio track, it is an alternate audio track
     const fromAltAudio = this.altAudio !== AlternateAudio.DISABLED;
     const altAudio = useAlternateAudio(data.url, hls);
@@ -881,27 +928,65 @@ export default class StreamController
         // Reset audio transmuxer so when switching back to main audio we're not still appending where we left off
         this.resetTransmuxer();
       }
-      // If switching from alt to main audio, flush all audio and trigger track switched
+      // If switching from alt to main audio, replace the audio buffer only.
+      // Flushing video here would clear buffered video and force a black
+      // screen/re-buffer even though main video is unchanged.
       if (fromAltAudio) {
         this.altAudio = AlternateAudio.DISABLED;
-        this.fragmentTracker.removeAllFragments();
-        hls.once(Events.BUFFER_FLUSHED, () => {
-          if (!this.hls as any) {
-            return;
-          }
-          this.hls.trigger(Events.AUDIO_TRACK_SWITCHED, data);
-        });
+        this.refillingMainAudio = true;
+        this.mainAudioRefillPending = true;
+        // Remove only main playlist state. Other playlist types (subtitles)
+        // keep their tracker state so their selection/rendering is unaffected.
+        // This also clears LL-HLS part buffered state for the main playlist.
+        this.fragmentTracker.removeAllFragments(PlaylistLevelType.MAIN);
+        this.mainAudioSwitchData = data;
+        hls.on(Events.BUFFER_FLUSHED, this.onMainAudioFlushed, this);
         hls.trigger(Events.BUFFER_FLUSHING, {
           startOffset: 0,
           endOffset: Number.POSITIVE_INFINITY,
-          type: null,
+          type: 'audio',
         });
+        // Start refilling immediately; the audio remove is queued ahead of
+        // any append triggered below, so ordering is guaranteed.
+        this.tickImmediate();
         return;
       }
       hls.trigger(Events.AUDIO_TRACK_SWITCHED, data);
     } else {
       this.altAudio = AlternateAudio.SWITCHING;
     }
+  }
+
+  private cancelMainAudioRefill() {
+    this.hls?.off(Events.BUFFER_FLUSHED, this.onMainAudioFlushed, this);
+    this.mainAudioSwitchData = null;
+    this.mainAudioRefillPending = false;
+    this.refillingMainAudio = false;
+  }
+
+  private onMainAudioFlushed(
+    event: Events.BUFFER_FLUSHED,
+    flushed: BufferFlushedData,
+  ) {
+    const data = this.mainAudioSwitchData;
+    if (!data || flushed.type !== ElementaryStreamTypes.AUDIO) {
+      return;
+    }
+    // Ignore flushes that are not the whole-audio remove requested when
+    // switching back to main audio (errors still complete the switch).
+    if (
+      !flushed.error &&
+      (flushed.start !== 0 || flushed.end !== Number.POSITIVE_INFINITY)
+    ) {
+      return;
+    }
+    this.hls?.off(Events.BUFFER_FLUSHED, this.onMainAudioFlushed, this);
+    this.mainAudioSwitchData = null;
+    this.mainAudioRefillPending = false;
+    // Scheduling now observes the audio SourceBuffer. The media buffered
+    // ranges still contain video and must not be used to decide that main
+    // audio is buffered.
+    this.hls?.trigger(Events.AUDIO_TRACK_SWITCHED, data);
   }
 
   private onAudioTrackSwitched(
@@ -935,6 +1020,12 @@ export default class StreamController
     let alternate = false;
     for (const type in tracks) {
       const track: BufferCreatedTrack = tracks[type];
+      // Keep a reference to the audio SourceBuffer. It is shared by main and
+      // alternate audio, and is the buffer main audio must be refilled into
+      // when switching back from an alternate track.
+      if (type === 'audio') {
+        this.audioBuffer = track.buffer;
+      }
       if (track.id === 'main') {
         name = type;
         mediaTrack = track;
@@ -1578,6 +1669,23 @@ export default class StreamController
     // Observe video SourceBuffer (this.mediaBuffer) only when alt-audio is used, otherwise observe combined media buffer
     const bufferOutput = this.getBufferOutput();
     return this.getFwdBufferInfo(bufferOutput, PlaylistLevelType.MAIN);
+  }
+
+  /**
+   * Forward buffer info for the audio SourceBuffer while refilling main audio.
+   * The audio buffer may still hold the alternate track's data until the flush
+   * requested on switching completes, so scheduling is forced to the playhead
+   * during that window. This lets the replacement fragment download start
+   * without waiting for the (video-backed) media buffered ranges to shrink.
+   */
+  private getMainAudioFwdBufferInfo(): BufferInfo | null {
+    if (this.mainAudioRefillPending) {
+      return BufferHelper.bufferInfo(null, this.playhead, 0);
+    }
+    return this.getFwdBufferInfo(
+      this.audioBuffer || null,
+      PlaylistLevelType.MAIN,
+    );
   }
 
   public get maxBufferLength(): number {

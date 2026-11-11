@@ -585,6 +585,38 @@ describe('FragmentTracker', function () {
         ).to.be.false;
       });
     });
+
+    it('should only remove fragments matching the provided playlist type', function () {
+      const mainFragment = createMockFragment(
+        {
+          startPTS: 0,
+          endPTS: 1,
+          sn: 1,
+          level: 1,
+          type: PlaylistLevelType.MAIN,
+        },
+        [ElementaryStreamTypes.VIDEO],
+      );
+      const subtitleFragment = new Fragment(
+        PlaylistLevelType.SUBTITLE,
+        '',
+      ) as MediaFragment;
+      Object.assign(subtitleFragment, {
+        startPTS: 0,
+        endPTS: 1,
+        sn: 1,
+        level: 1,
+      });
+      subtitleFragment.setStart(0);
+      subtitleFragment.duration = 1;
+      triggerFragLoadedAndFragBuffered(hls, mainFragment);
+      fragmentTracker.fragBuffered(subtitleFragment, true);
+
+      fragmentTracker.removeAllFragments(PlaylistLevelType.MAIN);
+
+      expect(fragmentTracker.hasFragment(mainFragment)).to.be.false;
+      expect(fragmentTracker.hasFragment(subtitleFragment)).to.be.true;
+    });
   });
 
   describe('gap tracking', function () {
